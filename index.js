@@ -27,6 +27,8 @@ const HY2_PORT = process.env.HY2_PORT || '';                // hy2端口，支�
 const REALITY_PORT = process.env.REALITY_PORT || '';        // reality端口，支持多端口的可以填写，否则留空
 const CFIP = process.env.CFIP || 'saas.sin.fan';            // 节点优选域名或优选ip
 const CFPORT = process.env.CFPORT || 443;                   // 节点优选域名或优选ip对应的端口
+const NODE_LIST_URL = process.env.NODE_LIST_URL || 'https://gist.githubusercontent.com/long393590890/8bb42c5a836c1d8345e43583a78663d9/raw/gistfile1.txt'; // 优选节点列表URL(每行格式: IP:端口#名称),设置后订阅节点将从该列表批量生成,留空则使用CFIP
+const NODE_PROTOCOLS = (process.env.NODE_PROTOCOLS || 'vless').toLowerCase().split(',').map(p => p.trim()).filter(Boolean); // 订阅生成的协议,逗号分隔可选: vless,vmess,trojan,例如只生成vless填 vless
 const NAME = process.env.NAME || 'Argo';                        // 节点名称
 const CHAT_ID = process.env.CHAT_ID || '';                  // Telegram chat_id  两个变量不全不推送节点到TG 
 const BOT_TOKEN = process.env.BOT_TOKEN || '';              // Telegram bot_token 两个变量不全不推送节点到TG 
@@ -726,6 +728,46 @@ async function getServerIP() {
   return serverIP;
 }
 
+// 拉取优选节点列表(每行格式: IP:端口#名称),返回 [{ip, port, name}]
+async function fetchNodeList() {
+  if (!NODE_LIST_URL) return [];
+  try {
+    const response = await axios.get(NODE_LIST_URL, { timeout: 8000 });
+    const lines = String(response.data).split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'));
+    const list = [];
+    for (const line of lines) {
+      const match = line.match(/^([^#]+)#(.+)$/);
+      if (!match) continue;
+      const [ip, port] = match[1].trim().split(':');
+      if (!ip || !isValidPort(port)) continue;
+      list.push({ ip: ip.trim(), port: parseInt(port), name: match[2].trim() });
+    }
+    console.log(`Fetched ${list.length} nodes from NODE_LIST_URL`);
+    return list;
+  } catch (error) {
+    console.error(`Failed to fetch NODE_LIST_URL, fallback to CFIP: ${error.message}`);
+    return [];
+  }
+}
+
+// 为单个入口地址按 NODE_PROTOCOLS 生成 ws+tls 节点链接
+function buildWsLinks(add, port, nodeName, argoDomain) {
+  let links = '';
+  if (NODE_PROTOCOLS.includes('vless')) {
+    links += `\nvless://${UUID}@${add}:${port}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}`;
+  }
+  if (NODE_PROTOCOLS.includes('vmess')) {
+    const VMESS = { v: '2', ps: `${nodeName}`, add: add, port: port, id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none', host: argoDomain, path: '/vmess-argo?ed=2560', tls: 'tls', sni: argoDomain, alpn: '', fp: 'firefox' };
+    links += `\nvmess://${Buffer.from(JSON.stringify(VMESS)).toString('base64')}`;
+  }
+  if (NODE_PROTOCOLS.includes('trojan')) {
+    links += `\ntrojan://${UUID}@${add}:${port}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}`;
+  }
+  return links;
+}
+
 // 生成 list 和 sub 信息
 async function generateLinks(argoDomain) {
   const ISP = await getMetaInfo();
@@ -733,15 +775,18 @@ async function generateLinks(argoDomain) {
   const SERVER_IP = await getServerIP();
 
   return new Promise((resolve) => {
-    setTimeout(() => {
-      const VMESS = { v: '2', ps: `${nodeName}`, add: CFIP, port: CFPORT, id: UUID, aid: '0', scy: 'auto', net: 'ws', type: 'none', host: argoDomain, path: '/vmess-argo?ed=2560', tls: 'tls', sni: argoDomain, alpn: '', fp: 'firefox' };
-      let subTxt = `
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}
-
-vmess://${Buffer.from(JSON.stringify(VMESS)).toString('base64')}
-
-trojan://${UUID}@${CFIP}:${CFPORT}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
-    `;
+    setTimeout(async () => {
+      // 优先使用节点列表批量生成,获取失败或未配置时回退到单个 CFIP
+      const nodeList = await fetchNodeList();
+      let subTxt = '';
+      if (nodeList.length > 0) {
+        nodeList.forEach(node => {
+          const entryName = NAME ? `${NAME}-${node.name}` : node.name;
+          subTxt += buildWsLinks(node.ip, node.port, entryName, argoDomain) + '\n';
+        });
+      } else {
+        subTxt += buildWsLinks(CFIP, CFPORT, nodeName, argoDomain);
+      }
 
       // HY2_PORT是有效端口号时生成hysteria2节点
       if (isValidPort(HY2_PORT)) {

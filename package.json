@@ -8,8 +8,8 @@
   "license": "MIT",
   "private": false,
   "scripts": {
-    "dev": "node index.js",
-    "start": "node index.js"
+    "dev": "node --env-file-if-exists=.env index.js",
+    "start": "node --env-file-if-exists=.env index.js"
   },
   "dependencies": {
     "axios": "latest"
